@@ -1,5 +1,6 @@
 # on-prem-ai-chatbot
-Чат-бот службы ИТ поддержки на предприятии
+# Чат-бот службы ИТ поддержки на предприятии
+```mermaid
 graph TB
     %% Определение стилей
     classDef user fill:#E1F5FE,stroke:#0277BD,stroke-width:2px,rx:10,ry:10;
@@ -57,3 +58,4 @@ graph TB
     %% Связи внутри AI
     Embed -.->|Vectorize| VecDB
     LLM -.->|Uses GPU| AI_Core
+```mermaid
