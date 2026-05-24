@@ -2,7 +2,6 @@
 
 ```plantuml
 @startuml
-skinparam handwritten false
 skinparam monochrome true
 skinparam shadowing false
 start
