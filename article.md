@@ -24,7 +24,7 @@ endif
 
 stop
 @enduml
-```plantuml
+```
 
 
 Рис. 2. Процесс прохождения высокоуровневого запроса пользователя через фильтры безопасности, классификатор и RAG-контур.
@@ -82,4 +82,94 @@ deactivate Sanitizer
 API --> User: Отображение решения в интерфейсе
 deactivate API
 @enduml
+```
+Рис. 3. Алгоритм работы модуля классификации интентов (Intent Router)
 ```plantuml
+@startuml
+skinparam monochrome true
+skinparam shadowing false
+
+start
+
+:Прием очищенного текста от PII Sanitizer;
+:Формирование Few-Shot промпта\n(передача примеров интентов под специфику завода);
+:Запрос к локальной модели Saiga Llama-3\nс фиксацией JSON-структуры ответа;
+
+:Инференс модели и генерация JSON-пакета;
+:Парсинг JSON-ответа\n(извлечение полей selected_intent и confidence_score);
+
+if (Показатель уверенности (confidence_score) >= 0.75?) then (Да)
+    if (Какой класс выбран в selected_intent?) then (technical_issue)
+        :Направление в контур RAG Pipeline;
+        :Семантический поиск по регламентам ИТ в Qdrant;
+        :Синтез ответа на основе инструкций;
+    else (greeting / chitchat)
+        :Обход баз данных;
+        :Генерация вежливого базового ответа;
+    endif
+else (Нет: confidence_score < 0.75)
+    :Классификация признана неуверенной;
+    :Присвоение класса 'out_of_scope' / 'unclear';
+    :Формирование JSON-пакета для отправки в ITSM (GLPI);
+    :Автоматическое создание тикета на инженера поддержки;
+    :Вывод уведомления: "Передаю ваш запрос специалисту";
+endif
+
+:Передача сформированного текста на демаскирование;
+stop
+@enduml
+```
+
+
+
+```plantuml
+@startuml
+start
+:Получение регламента/инструкции (PDF/Docx);
+partition "Предобработка" {
+  :Парсинг текста из документа;
+  :Разбиение на фрагменты (Chunking);
+  note right: Например, по 500 символов\nс перекрытием в 10%
+}
+partition "Векторизация" {
+  :Отправка чанков в Embedding-модель;
+  :Получение векторных представлений;
+}
+partition "Хранение" {
+  :Запись векторов в Qdrant;
+  :Привязка метаданных\n(номер приказа, раздел, дата);
+}
+if (Ошибки при индексации?) then (да)
+  :Логирование ошибки;
+  :Уведомление администратора;
+else (нет)
+  :Статус: "Документ доступен для поиска";
+endif
+stop
+@enduml
+```
+
+Взаимодейстивие с пользователем 
+
+```plantuml
+@startuml
+actor "Сотрудник завода" as User
+participant "Интерфейс чат-бота" as UI
+participant "PII Sanitizer" as Sanitizer
+participant "Embedding Model" as Embedder
+participant "Qdrant (Vector DB)" as VectorDB
+participant "Local LLM" as LLM
+
+User -> UI: Задает вопрос по регламенту
+UI -> Sanitizer: Передает текст запроса
+Sanitizer -> Sanitizer: Маскирует ПДн (ФИО, телефоны)
+Sanitizer -> Embedder: Чистый текст запроса
+Embedder -> Embedder: Генерация вектора запроса
+Embedder -> VectorDB: Поиск похожих фрагментов (регламентов)
+VectorDB -> Embedder: Возвращает топ-N фрагментов текста
+Embedder -> LLM: Промпт: [Контекст из БЗ] + [Вопрос]
+LLM -> LLM: Генерация ответа с цитированием
+LLM -> UI: Готовый ответ пользователю
+UI -> User: Отображает инструкцию
+@enduml
+```
