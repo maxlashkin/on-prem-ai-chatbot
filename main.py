@@ -2,12 +2,11 @@ import os
 import re
 import requests
 import json
-import markdown  # Добавлен импорт для обработки разметки
+import markdown
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
-from typing import Dict, Any
+from typing import Dict, Any, List
 from fastapi.middleware.cors import CORSMiddleware
-
 
 # Актуальные импорты LangChain
 from langchain_ollama import ChatOllama, OllamaEmbeddings
@@ -19,19 +18,20 @@ from qdrant_client import QdrantClient
 
 app = FastAPI(
     title="ITSM AI Integration Gateway",
-    description="Компонент MVP для синхронной интеграции GLPI, Qdrant и Ollama (v3.0 - Enterprise)"
+    description="Компонент MVP с двухэтапной валидацией ИТ-тематики и выводом сниппетов (v4.2-Secure)"
 )
 
+# Разрешаем CORS для бесшовной интеграции с фронтендом GLPI
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # Для диплома оставляем "*", чтобы на защите CORS ничего не заблокировал
+    allow_origins=["*"], # Для диплома оставляем "*", чтобы на защите не заблокировались запросы
     allow_credentials=True,
     allow_methods=["*"], 
     allow_headers=["*"], 
 )
 
 # ==========================================
-# 1. КОНФИГУРАЦИЯ (ВМ И ТОКЕНЫ)
+# 1. КОНФИГУРАЦИЯ (ВМ, АДРЕСА И ТОКЕНЫ)
 # ==========================================
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://192.168.222.66:11434")
 QDRANT_URL = os.getenv("QDRANT_URL", "http://192.168.222.66:6333")
@@ -42,273 +42,284 @@ GLPI_APP_TOKEN = "EkgIi2puJ3pysg6J1Kzs02DGP5PPWkIaWYYrGnaT"
 COLLECTION_NAME = "factory_regulations"
 
 # ==========================================
-# 2. ИНИЦИАЛИЗАЦИЯ ИИ-КОМПОНЕНТОВ
+# 2. ИНИЦИАЛИЗАЦИЯ ИИ КОМПОНЕНТОВ
 # ==========================================
-llm = ChatOllama(
-    base_url=OLLAMA_BASE_URL,
-    model="saiga3",
-    temperature=0.2
-)
-
-embeddings = OllamaEmbeddings(
-    base_url=OLLAMA_BASE_URL,
-    model="bge-m3:latest"
-)
+llm = ChatOllama(base_url=OLLAMA_BASE_URL, model="saiga3", temperature=0.1)  # Низкая температура для стабильности классификации
+embeddings = OllamaEmbeddings(base_url=OLLAMA_BASE_URL, model="bge-m3:latest")
 
 client = QdrantClient(url=QDRANT_URL)
 vectorstore = QdrantVectorStore.from_existing_collection(
-    embedding=embeddings,
-    collection_name=COLLECTION_NAME,
-    url=QDRANT_URL
+    embedding=embeddings, collection_name=COLLECTION_NAME, url=QDRANT_URL
 )
-retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
+retriever = vectorstore.as_retriever(search_kwargs={"k": 2})
 
 # ==========================================
-# 3. СЕРВИСНЫЕ ФУНКЦИИ И ОПТИМИЗАЦИЯ СЕТИ
+# 3. ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ И МАСКИРОВАНИЕ
 # ==========================================
-
 def mask_personal_data(text: str) -> str:
-    """Маскирование ПДн (IP, Телефоны, АРМ)."""
     if not text: return ""
     text = re.sub(r'\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b', '[IP_REDACTED]', text)
     text = re.sub(r'(\+7|8)?[\s\-]?\(?\d{3}\)?[\s\-]?\d{3}([\s\-]?\d{2}){2}|\b\d{4}\b', '[PHONE_REDACTED]', text)
     text = re.sub(r'(АРМ|ARM)[\s№_-]*\d+', '[ARM_REDACTED]', text)
     return text
 
-def post_solution_to_glpi(ticket_id: int, solution_text: str):
-    """Добавляет ответ ИИ как публичный комментарий (Follow-up), не закрывая заявку."""
+def extract_context_and_sources(query: str):
+    """Извлекает текст документов и их имена файлов со сниппетами из Qdrant."""
+    try:
+        docs = retriever.invoke(query)
+    except Exception as e:
+        print(f"[Qdrant Error] {e}")
+        return "", []
+        
+    context_text = "\n\n".join([doc.page_content for doc in docs])
+    
+    sources_detailed = []
+    seen_chunks = set()
+    
+    for doc in docs:
+        meta = doc.metadata
+        name = meta.get("file_name") or meta.get("source") or meta.get("title") or "Инструкция.pdf"
+        name = os.path.basename(name)
+        
+        chunk_content = doc.page_content.strip()
+        if chunk_content and chunk_content not in seen_chunks:
+            seen_chunks.add(chunk_content)
+            sources_detailed.append({
+                "file_name": name,
+                "snippet": chunk_content
+            })
+                
+    return context_text, sources_detailed
+
+def post_solution_to_glpi(ticket_id: int, solution_text: str, sources: List[dict]):
     session_token = None
     solution_html = markdown.markdown(solution_text, extensions=['nl2br', 'sane_lists'])
-    
-    init_headers = {
-        "Authorization": f"user_token {GLPI_USER_TOKEN}",
-        "App-Token": GLPI_APP_TOKEN,
-        "Content-Type": "application/json"
-    }
-    
+
+    sources_html = ""
+    if sources:
+        file_names = set([s.get("file_name", "Инструкция") for s in sources])
+        sources_html = "<br><br><b>Использованные нормативные документы базы знаний:</b><ul>" + "".join([f"<li>📄 {name}</li>" for name in file_names]) + "</ul>"
+
+    init_headers = {"Authorization": f"user_token {GLPI_USER_TOKEN}", "App-Token": GLPI_APP_TOKEN, "Content-Type": "application/json"}
     try:
         res = requests.get(f"{GLPI_REST_URL}/initSession", headers=init_headers, timeout=10)
-        if res.status_code != 200:
-            print(f"[GLPI Auth Error] Код: {res.status_code}, Ответ: {res.text}")
-            return
+        if res.status_code != 200: return
         session_token = res.json().get("session_token")
 
-        auth_headers = {
-            "Session-Token": session_token,
-            "App-Token": GLPI_APP_TOKEN,
-            "Content-Type": "application/json"
-        }
+        auth_headers = {"Session-Token": session_token, "App-Token": GLPI_APP_TOKEN, "Content-Type": "application/json"}
         
         payload = {
             "input": {
                 "itemtype": "Ticket",
                 "items_id": ticket_id,
-                "content": (
-                    f"<b>🤖 Предложение от ИИ-ассистента (RAG):</b><br><br>"
-                    f"{solution_html}<br><br>"
-                    f"<small><i>Ответ добавлен автоматически на основе базы знаний завода.</i></small>"
-                ),
-                "is_private": 0  
+                "content": f"<b>🤖 Решение от ИИ:</b><br><br>{solution_html}{sources_html}<hr style='border: 0; border-top: 1px solid #e2e8f0; margin: 10px 0 5px 0;'><small style='color: #94a3b8; font-style: italic;'>ИИ может ошибаться. Рекомендуем проверять ответы.</small>",
+                "is_private": 0
             }
         }
-
-        sol_res = requests.post(f"{GLPI_REST_URL}/ITILFollowup", headers=auth_headers, json=payload, timeout=10)
-        if sol_res.status_code == 201:
-            print(f"[GLPI Success] Комментарий успешно добавлен в тикет #{ticket_id}.")
-        else:
-            print(f"[GLPI Error] Не удалось добавить комментарий: {sol_res.text}")
-
+        
+        requests.post(f"{GLPI_REST_URL}/ITILFollowup", headers=auth_headers, json=payload, timeout=10)
     except Exception as e:
-        print(f"[GLPI Connection Error] {e}")
+        print(f"Ошибка отправки комментария в GLPI: {e}")
     finally:
         if session_token:
             requests.get(f"{GLPI_REST_URL}/killSession", headers=auth_headers, timeout=5)
 
 def create_ticket_via_api(title: str, content: str, glpi_user_id: int = None) -> int:
-    """Создает новую заявку в GLPI, привязывая её к конкретному пользователю."""
     session_token = None
-    init_headers = {
-        "Authorization": f"user_token {GLPI_USER_TOKEN}",
-        "App-Token": GLPI_APP_TOKEN,
-        "Content-Type": "application/json"
-    }
-    
+    init_headers = {"Authorization": f"user_token {GLPI_USER_TOKEN}", "App-Token": GLPI_APP_TOKEN, "Content-Type": "application/json"}
     try:
         res = requests.get(f"{GLPI_REST_URL}/initSession", headers=init_headers, timeout=10)
-        if res.status_code != 200:
-            return 0
+        if res.status_code != 200: return 0
         session_token = res.json().get("session_token")
-
-        auth_headers = {
-            "Session-Token": session_token,
-            "App-Token": GLPI_APP_TOKEN,
-            "Content-Type": "application/json"
-        }
+        auth_headers = {"Session-Token": session_token, "App-Token": GLPI_APP_TOKEN, "Content-Type": "application/json"}
         
         clean_title = title.strip().replace("\n", " ")
-        if len(clean_title) > 60:
-            clean_title = clean_title[:57] + "..."
+        if len(clean_title) > 60: clean_title = clean_title[:57] + "..."
 
-        # Базовый payload создания заявки
-        ticket_input = {
-            "name": clean_title,
-            "content": content,
-            "urgency": 3,
-            "impact": 3,
-            "status": 1
-        }
-
-        # Если фронтенд передал ID реального пользователя, подставляем его как автора!
+        ticket_input = {"name": clean_title, "content": content, "urgency": 3, "impact": 3, "status": 1}
         if glpi_user_id:
-            # В GLPI связь тикета с автором часто идет через массив или явные поля:
-            ticket_input["_users_id_requester"] = glpi_user_id  # Для стандартных форм
-            ticket_input["users_id_recipient"] = glpi_user_id   # Получатель
+            ticket_input["_users_id_requester"] = glpi_user_id  
+            ticket_input["users_id_recipient"] = glpi_user_id   
 
         payload = {"input": ticket_input}
-
         ticket_res = requests.post(f"{GLPI_REST_URL}/Ticket", headers=auth_headers, json=payload, timeout=10)
-        if ticket_res.status_code == 201:
-            return ticket_res.json().get("id")
+        if ticket_res.status_code == 201: return ticket_res.json().get("id")
         return 0
-
     except Exception as e:
-        print(f"[GLPI API Exception] {e}")
+        print(f"Ошибка создания тикета через API: {e}")
         return 0
     finally:
-        if session_token:
-            requests.get(f"{GLPI_REST_URL}/killSession", headers=auth_headers, timeout=5)
+        if session_token: requests.get(f"{GLPI_REST_URL}/killSession", headers=auth_headers, timeout=5)
 
 # ==========================================
-# 4. СТАНДАРТНАЯ ЦЕПОЧКА RAG ДЛЯ ВЕБХУКОВ
+# 4. ВЫДЕЛЕННЫЕ ЦЕПОЧЕКИ ПРОМПТОВ (GUARDRAILS)
 # ==========================================
-prompt_template = ChatPromptTemplate.from_messages([
+
+# СЛОЙ 1: Абсолютный классификатор темы (Входной фильтр)
+prompt_classifier = ChatPromptTemplate.from_messages([
     ("system", (
-        "Ты — ведущий ИИ-специалист службы ИТ-поддержки завода Омский каучук.\n"
-        "Помоги пользователю, используя только предоставленный контекст. Используй списки и заголовки Markdown для оформления.\n"
-        "Если точного ответа нет в контексте, ответь ровно одной фразой: 'ДАННЫЕ_НЕ_НАЙДЕНЫ'\n\n"
-        "Инструкции из базы знаний:\n{context}"
+        "Ты — автоматический шлюз-классификатор обращений в ИТ-поддержку завода Омский каучук.\n"
+        "Твоя единственная цель — определить, относится ли текст к сфере информационных технологий, вычислительной техники или оргтехники.\n\n"
+        "ЦЕЛЕВЫЕ ТЕМЫ (относятся к ИТ): Компьютеры, мониторы, мыши, принтеры, картриджи, Kyocera, Windows, Active Directory, пароли, сети, Wi-Fi, 1С, СЭД, почта, СУБД, телефония, ремонт техники.\n"
+        "НЕЦЕЛЕВЫЕ ТЕМЫ (не относятся к ИТ): Приветствия, 'как дела', погода, кулинария, ремонт мебели, заказ канцтоваров, философия, шутки, абстрактные вопросы.\n\n"
+        "ПРАВИЛО ОТВЕТА:\n"
+        "- Если запрос СВЯЗАН с ИТ или оргтехникой, верни РОВНО ОДИН СИМВОЛ: 1\n"
+        "- Если запрос НЕ связан с ИТ (флуд, офтоп, приветствие), верни РОВНО ОДИН СИМВОЛ: 0\n"
+        "- Не пиши никаких вводных слов, знаков препинания или объяснений. Только цифру 1 или 0."
+    )),
+    ("user", "Запрос пользователя: {query}")
+])
+
+# СЛОЙ 2: Экспресс-генератор коротких ответов (для виджета)
+#prompt_short = ChatPromptTemplate.from_messages([
+#    ("system", (
+#        "Ты — ИИ-инженер ИТ-поддержки завода Омский каучук.\n"
+#        "Твоя задача — выдать КРАТКОЕ, строго тезисное ИТ-решение для всплывающей подсказки оператора (3-4 лаконичных пункта).\n"
+#        "Пиши исключительно технические шаги. Никакой воды, приветствий или вежливых заключений.\n\n"
+#        "Контекст из регламентов завода:\n{context}"
+#    )),
+#    ("user", "Запрос: {query}")
+#])
+prompt_short = ChatPromptTemplate.from_messages([
+    ("system", (
+        "Ты — ИИ-инженер ИТ-поддержки завода Омский каучук.\n"
+        "Твоя задача — выдать КРАТКОЕ, строго тезисное ИТ-решение для всплывающей подсказки оператора (3-4 лаконичных пункта).\n\n"
+        "КРИТИЧЕСКИЕ ЗАПРЕТЫ:\n"
+        "- ЗАПРЕЩЕНО выводить фразы вроде 'Официальный ответ по ИТ-инциденту' или 'Заявка №'.\n"
+        "- ЗАПРЕЩЕНО придумывать номера заявок, писать приветствия, вводные слова или подписи.\n"
+        "- Начинай ответ СРАЗУ с первого технического пункта действий.\n\n"
+        "Контекст из регламентов завода:\n{context}"
+    )),
+    ("user", "Запрос: {query}")
+])
+
+# СЛОЙ 3: Генератор полных ответов (для вебхука в тикет)
+#prompt_full = ChatPromptTemplate.from_messages([
+#    ("system", (
+#        "Ты — ведущий ИИ-специалист технической поддержки завода Омский каучук.\n"
+#        "Сформируй развернутый, глубокий официальный ответ по ИТ-инциденту для фиксации в истории заявки.\n"
+#        "Опиши возможные технические причины неисправности и дай детальные инструкции по ее устранению.\n"
+#        "Оформляй структуру красиво, используя заголовки Markdown (### или ####) и нумерованные списки.\n\n"
+#        "Контекст из базы знаний завода:\n{context}"
+#    )),
+#    ("user", "Заявка: {query}")
+#])
+# ==========================================
+# СЛОЙ 3: Исправленный генератор полных ответов (БЕЗ ГАЛЛЮЦИНАЦИЙ И ПОВТОРОВ)
+# ==========================================
+prompt_full = ChatPromptTemplate.from_messages([
+    ("system", (
+        "Ты — ведущий ИИ-специалист технической поддержки завода Омский каучук.\n"
+        "Сформируй развернутый технический разбор ИТ-проблемы для фиксации в истории заявки.\n\n"
+        "КРИТИЧЕСКИЕ ЗАПРЕТЫ:\n"
+        "- КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО писать шапки, заголовки и строки вида 'Официальный ответ по ИТ-инциденту' или 'Заявка №'.\n"
+        "- ЗАПРЕЩЕНО генерировать или выдумывать номера инцидентов, дату, время, имя оператора или заявителя.\n"
+        "- Не пиши никаких вводных фраз и приветствий.\n\n"
+        "ТРЕБОВАНИЯ К СТРУКТУРЕ (начинай сразу с сути):\n"
+        "1. Возможные причины неисправности (кратко перечисли технические причины).\n"
+        "2. Пошаговая инструкция по устранению (детальные технические шаги для инженера).\n\n"
+        "Оформляй структуру строго через заголовки Markdown (### или ####) и нумерованные списки.\n\n"
+        "Контекст из базы знаний завода:\n{context}"
     )),
     ("user", "Заявка: {query}")
 ])
 
-def format_docs(docs):
-    return "\n\n".join(doc.page_content for doc in docs)
-
-rag_chain = (
-    {"context": retriever | format_docs, "query": RunnablePassthrough()}
-    | prompt_template
-    | llm
-    | StrOutputParser()
-)
+chain_classifier = prompt_classifier | llm | StrOutputParser()
+chain_short = prompt_short | llm | StrOutputParser()
+chain_full = prompt_full | llm | StrOutputParser()
 
 # ==========================================
-# 5. ЭНДПОИНТ ВЕБХУКА (СТРАТЕГИЯ SILENT SKIP)
+# 5. API ЭНДПОИНТЫ
 # ==========================================
+
+@app.post("/api/v1/chat")
+async def chat_assistant(request: Request):
+    try:
+        data = await request.json()
+        user_text = data.get("text", "").strip()
+        
+        # Первичный отсекатель по длине
+        if not user_text or len(user_text) < 6: 
+            return {"response": "ДАННЫЕ_НЕ_НАЙДЕНЫ", "sources": []}
+
+        safe_query = mask_personal_data(user_text)
+        
+        # ЭТАП 1: Классификация запроса на ИТ/Офтоп
+        classification = await chain_classifier.ainvoke({"query": safe_query})
+        classification = classification.strip()
+        
+        print(f"[Guardrail Classifier] Запрос: '{safe_query}' -> Результат: {classification}")
+        
+        # Защита от пробития фильтра: если в ответе нет явной '1' или есть признаки '0'
+        if "1" not in classification or classification.startswith("0"):
+            return {"response": "ДАННЫЕ_НЕ_НАЙДЕНЫ", "sources": []}
+
+        # ЭТАП 2: Поиск совпадений в Qdrant
+        context, sources_data = extract_context_and_sources(safe_query)
+        
+        # Если в Qdrant пусто, подменяем контекст жестким указанием, исключающим галлюцинации
+        if not context.strip():
+            context = "В официальных инструкциях завода нет прямого совпадения. Дай стандартную общую рекомендацию по решению данной ИТ-проблемы."
+            sources_data = []
+            
+        # ЭТАП 3: Генерация краткого ответа
+        ai_answer = await chain_short.ainvoke({"context": context, "query": safe_query})
+        
+        if "ДАННЫЕ_НЕ_НАЙДЕНЫ" in ai_answer:
+            return {"response": "ДАННЫЕ_НЕ_НАЙДЕНЫ", "sources": []}
+
+        return {"response": ai_answer, "sources": sources_data}
+        
+    except Exception as e:
+        print(f"[API ERROR] Ошибка в блоке инвайрона: {e}")
+        return {"response": "ДАННЫЕ_НЕ_НАЙДЕНЫ", "sources": []}
+
+
 @app.post("/api/v1/glpi-webhook")
 async def handle_glpi_webhook(request: Request):
-    raw_body = await request.body()
-    if not raw_body:
-        return {"status": "error", "message": "Empty request body"}
-
     try:
         payload = await request.json()
-    except Exception as json_err:
-        return {"status": "error", "message": "Invalid JSON body"}
+    except Exception: return {"status": "error"}
 
     event_data = payload.get("event_data", {})
     ticket_id = event_data.get("id")
     user_query = event_data.get("content")
 
-    if not ticket_id or not user_query:
-        return {"status": "ignored", "reason": "Missing ticket_id or content"}
+    if not ticket_id or not user_query: return {"status": "ignored"}
 
-    print(f"[ITSM Gateway] Тикет #{ticket_id}: Проверка во внутренних регламентах...")
     safe_query = mask_personal_data(user_query)
+    
+    # Вебхук также защищаем классификатором от случайного спама
+    classification = await chain_classifier.ainvoke({"query": safe_query})
+    if "1" not in classification.strip():
+        print(f"[Webhook Guard] Тикет #{ticket_id} пропущен: не относится к ИТ.")
+        return {"status": "skipped"}
 
-    # Запускаем генерацию ответа
-    ai_response = await rag_chain.ainvoke(safe_query)
+    context, sources = extract_context_and_sources(safe_query)
+    ai_response = await chain_full.ainvoke({"context": context, "query": safe_query})
 
-    # СТРАТЕГИЯ МИНИМИЗАЦИИ ЛОЖНЫХ СРАБАТЫВАНИЙ (Silent Skip)
-    if "ДАННЫЕ_НЕ_НАЙДЕНЫ" in ai_response or len(ai_response.strip()) < 25:
-        print(f"[ITSM Gateway] Тикет #{ticket_id}: Инструкция в RAG не найдена. Робот пропускает тикет для ручного разбора инженерами.")
-        return {"status": "skipped", "reason": "No relevant instructions found in Qdrant"}
+    if "ДАННЫЕ_НЕ_НАЙДЕНЫ" in ai_response or len(ai_response.strip()) < 15:
+        return {"status": "skipped"}
 
-    print(f"[ITSM Gateway] Тикет #{ticket_id}: Решение успешно найдено. Публикация в GLPI...")
-    post_solution_to_glpi(ticket_id, ai_response)
-
+    post_solution_to_glpi(ticket_id, ai_response, sources)
     return {"status": "success", "ticket_id": ticket_id}
 
-# ==========================================
-# 6. ЭНДПОИНТ ОПЕРАТИВНОЙ ПОДСКАЗКИ (ИНТРАКТИВНЫЙ UI)
-# ==========================================
-@app.post("/api/v1/chat")
-async def chat_assistant(request: Request):
-    """
-    Эндпоинт для виджета оперативной подсказки диспетчера/самообслуживания.
-    Возвращает контент или маркер действия для генерации кнопок во фронтенде.
-    """
-    try:
-        data = await request.json()
-        user_text = data.get("text", "").strip()
-        
-        if not user_text or len(user_text) < 10:
-            return {"response": ""}
 
-        # 1. Прямой поиск в Qdrant (без дублирования вызовов цепочки)
-        docs = retriever.invoke(user_text)
-        
-        # Если Qdrant вернул пустой список документов, сразу прерываемся и отдаем управляющий флаг
-        if not docs or len(docs) == 0:
-            return {"response": "ДАННЫЕ_НЕ_НАЙДЕНЫ"}
-            
-        context = "\n".join([doc.page_content for doc in docs])
-        
-        # Дополнительная валидация контекста (на случай, если прилетел нерелевантный мусор)
-        if not context.strip():
-            return {"response": "ДАННЫЕ_НЕ_НАЙДЕНЫ"}
-
-        # 2. Генерируем финальный понятный ответ с помощью Saiga3
-        prompt = (
-            f"Ты — ИИ-помощник ИТ-поддержки. Используя только указанные инструкции, ответь на вопрос.\n"
-            f"Если в инструкциях нет ответа, напиши только одно слово: ДАННЫЕ_НЕ_НАЙДЕНЫ\n\n"
-            f"Инструкции:\n{context}\n\n"
-            f"Вопрос пользователя: {user_text}"
-        )
-        
-        ai_answer = llm.invoke(prompt).content
-        
-        if "ДАННЫЕ_НЕ_НАЙДЕНЫ" in ai_answer:
-            return {"response": "ДАННЫЕ_НЕ_НАЙДЕНЫ"}
-
-        return {"response": ai_answer}
-        
-    except Exception as e:
-        print(f"[API ERROR] Ошибка в блоке чата: {str(e)}")
-        return {"response": f"Ошибка связи с ИИ-модулем: {str(e)}"}
-
-# Новый эндпоинт для обработки клика «Оформить заявку»
 @app.post("/api/v1/create-ticket")
 async def api_create_ticket(request: Request):
     try:
         data = await request.json()
         raw_text = data.get("text", "").strip()
-        # Принимаем ID пользователя из запроса
         glpi_user_id = data.get("user_id") 
         
-        if not raw_text:
-            raise HTTPException(status_code=400, detail="Текст заявки пуст")
+        if not raw_text: raise HTTPException(status_code=400, detail="Текст заявки пуст")
             
         safe_text = mask_personal_data(raw_text)
-        
-        # Передаем ID пользователя в функцию создания
         ticket_id = create_ticket_via_api(title=raw_text, content=safe_text, glpi_user_id=glpi_user_id)
         
-        if ticket_id > 0:
-            return {"status": "success", "ticket_id": ticket_id}
-        else:
-            return {"status": "error", "message": "Не удалось создать тикет через API"}
-            
-    except Exception as e:
+        if ticket_id > 0: return {"status": "success", "ticket_id": ticket_id}
+        return {"status": "error", "message": "Ошибка записи тикета в базу GLPI"}
+    except Exception as e: 
         return {"status": "error", "message": str(e)}
 
 if __name__ == "__main__":
